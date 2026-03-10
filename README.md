@@ -26,7 +26,7 @@ Simple 4-layer MLP for tabular data (TabularNN) and Adam/AdamW optimizers, optio
 *  5-fold evaluation over the test set indices for adversarial files
 *  Timing per attack.
 
-# Environment & Setup (Python dependencies):
+# Environment & Setup:
 pandas, numpy, scikit-learn, torch, torchvision (GPU optional), adversarial-robustness-toolbox (ART), scipy, statsmodels, matplotlib
 
 --- pip install torch pandas numpy scikit-learn adversarial-robustness-toolbox scipy statsmodels matplotlib
