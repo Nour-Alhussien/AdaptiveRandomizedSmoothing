@@ -380,3 +380,46 @@ adversarial_loaders = {
     "HSJ": "X_adv_hsj_url.txt",
     "Clean": "X_test_clean.txt"
 }
+
+# Testing on clean test data
+model.eval()
+with torch.no_grad():
+    X_test_tensor, y_test_tensor = X_test_tensor.to(device), y_test_tensor.to(device)
+    test_outputs = model(X_test_tensor)
+    test_predictions = torch.argmax(test_outputs, axis=1)
+    clean_accuracy = accuracy_score(y_test_tensor.cpu().numpy(), test_predictions.cpu().numpy())
+    print(f"Clean test accuracy: {clean_accuracy:.4f}")
+    with open(results_file, "a") as f:
+        f.write(f"\nClean test accuracy: {clean_accuracy:.4f}\n")
+
+# Evaluate on adversarial examples
+for attack_name, file_path in adversarial_loaders.items():
+    # Load adversarial data
+    X_adv = np.loadtxt(file_path, delimiter=",")  # Load the CSV as a NumPy array
+    # Check if the number of features matches the model input size
+    if X_adv.shape[1] != X_train_tensor.shape[1]:
+        print(f"Warning: {attack_name} adversarial examples have incorrect number of features ({X_adv.shape[1]} instead of {X_train_tensor.shape[1]}). Skipping evaluation.")
+        continue  # Skip evaluation for this attack
+
+
+    X_adv_tensor = torch.tensor(X_adv, dtype=torch.float32).to(device)
+    # to solve the mismatch size between x_adv and  y_true
+
+    # Record evaluation time
+    start_time = time.time()
+    with torch.no_grad():
+        adv_outputs = model(X_adv_tensor)
+        adv_predictions = torch.argmax(adv_outputs, axis=1)
+    end_time = time.time()
+
+    # Compute adversarial accuracy
+    adv_accuracy = accuracy_score(y_test_tensor.cpu().numpy(), adv_predictions.cpu().numpy())
+    eval_time = end_time - start_time
+
+    # Print and save results
+    print(f"{attack_name} adversarial accuracy: {adv_accuracy:.4f}")
+    print(f"Time taken for {attack_name} evaluation: {eval_time:.4f} seconds")
+    with open(results_file, "a") as f:
+        f.write(f"{attack_name} adversarial accuracy: {adv_accuracy:.4f}\n")
+        f.write(f"Time taken for {attack_name} evaluation: {eval_time:.4f} seconds\n")
+
