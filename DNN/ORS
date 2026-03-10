@@ -1,0 +1,435 @@
+
+### code to compare with the original randomized smoothing ###
+
+import torch
+import os
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from scipy.stats import norm
+from statsmodels.stats.proportion import proportion_confint
+import numpy as np
+from math import ceil
+
+# Define your Tabular Neural Network
+class TabularNN(nn.Module):
+    def __init__(self, input_size, dropout_rate=0.25):
+        super(TabularNN, self).__init__()
+        self.fc1 = nn.Linear(input_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 32)
+        self.fc4 = nn.Linear(32, 2) 
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = torch.relu(self.fc2(x))
+        x = torch.relu(self.fc3(x))
+        x = self.fc4(x)  
+        return x
+
+# Original Randomized Smoothing (certification method)
+class Smooth:
+    ABSTAIN = -1
+
+    def __init__(self, base_classifier: nn.Module, num_classes: int, sigma: float):
+        self.base_classifier = base_classifier
+        self.num_classes = num_classes
+        self.sigma = sigma
+
+    def certify(self, x: torch.tensor, n0: int, n: int, alpha: float, batch_size: int):
+        self.base_classifier.eval()
+        counts_selection = self._sample_noise(x, n0, batch_size)
+        cAHat = counts_selection.argmax().item()
+        counts_estimation = self._sample_noise(x, n, batch_size)
+        nA = counts_estimation[cAHat].item()
+        pABar = self._lower_confidence_bound(nA, n, alpha)
+        if pABar < 0.5:
+            predicted_class = Smooth.ABSTAIN
+            radius = 0.0
+        else:
+            predicted_class = cAHat
+            radius = self.sigma * norm.ppf(pABar)
+
+        file_path = "/content/drive/MyDrive/UNSW_Blanced/original_smoothing_results.txt"
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "a") as file:
+                file.write(f"Predicted Class: {predicted_class}, Radius: {radius}, Abstain: {predicted_class == Smooth.ABSTAIN}\n")
+        except Exception:
+            pass
+
+        return predicted_class, radius
+
+    def _sample_noise(self, x: torch.tensor, num: int, batch_size: int):
+        with torch.no_grad():
+            counts = np.zeros(self.num_classes, dtype=int)
+            remaining = num
+            while remaining > 0:
+                this_batch_size = min(batch_size, remaining)
+                remaining -= this_batch_size
+                batch = x.repeat((this_batch_size, 1))
+                noise = torch.randn_like(batch) * self.sigma
+                predictions = self.base_classifier(batch + noise).argmax(1)
+                counts += np.bincount(predictions.cpu().numpy(), minlength=self.num_classes)
+            return counts
+
+    def _lower_confidence_bound(self, NA: int, N: int, alpha: float) -> float:
+        return proportion_confint(NA, N, alpha=2 * alpha, method="beta")[0]
+
+# Training loop with noise
+def train_model(model, train_loader, criterion, optimizer, noise_sd, num_epochs=10):
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.cuda(), labels.cuda()
+            optimizer.zero_grad()
+            noisy_inputs = inputs + torch.randn_like(inputs) * noise_sd
+            outputs = model(noisy_inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss / len(train_loader):.4f}")
+
+# Evaluation function
+def evaluate_model(model, test_loader, noise_sd):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.cuda(), labels.cuda()
+            noisy_inputs = inputs + torch.randn_like(inputs) * noise_sd
+            outputs = model(noisy_inputs)
+            predictions = outputs.argmax(dim=1)
+            correct += (predictions == labels).sum().item()
+            total += labels.size(0)
+        accuracy = 100 * correct / total
+        print(f"Test Accuracy: {accuracy:.2f}%")
+        return accuracy
+
+# ---- UPDATED: evaluation against adversarial inputs with timing ----
+def test_on_adversarial_original(
+    smoother,                 # instance of Smooth(base_classifier, num_classes, sigma)
+    X_adv_tensor,             # torch.Tensor [N, D] on device
+    y_true_np,                # numpy array of labels 
+    n0=100, n=1000, alpha=0.001, batch_size=64,
+    save_to: str = None, tag: str = ""
+):
+    import time
+    device = next(smoother.base_classifier.parameters()).device
+
+    total = X_adv_tensor.size(0)
+    correct = 0
+    certified_correct = 0
+    abstain = 0
+    radii = []
+
+    t_all_start = time.time()
+    certify_time = 0.0
+
+    with torch.no_grad():
+        for i in range(total):
+            x_adv = X_adv_tensor[i].unsqueeze(0).to(device)
+            y_true = int(y_true_np[i])
+
+            t0 = time.time()
+            c_hat, r = smoother.certify(
+                x_adv, n0=n0, n=n, alpha=alpha, batch_size=batch_size
+            )
+            certify_time += (time.time() - t0)
+
+            # plain prediction (no noise)
+            logits = smoother.base_classifier(x_adv)
+            y_pred = int(torch.argmax(logits, dim=1).item())
+
+            if y_pred == y_true:
+                correct += 1
+            if c_hat == y_true:
+                certified_correct += 1
+            if c_hat == smoother.ABSTAIN:
+                abstain += 1
+            if r > 0:
+                radii.append(float(r))
+
+    total_time = time.time() - t_all_start
+    ms_per_sample = (certify_time / max(total, 1)) * 1000.0
+
+    acc = 100.0 * correct / total if total > 0 else 0.0
+    cert_acc = 100.0 * certified_correct / total if total > 0 else 0.0
+    abstain_pct = 100.0 * abstain / total if total > 0 else 0.0
+    avg_r = float(np.mean(radii)) if len(radii) > 0 else 0.0
+
+    msg = (f"{tag} OriginalRS | Acc: {acc:.2f}% | "
+           f"Certified: {cert_acc:.2f}% | Abstain: {abstain_pct:.2f}% | "
+           f"Avg R: {avg_r:.4f} | TimeTot: {total_time:.2f}s | Cert ms/sample: {ms_per_sample:.2f}")
+    print(msg)
+    if save_to is not None:
+        os.makedirs(os.path.dirname(save_to), exist_ok=True) if os.path.dirname(save_to) else None
+        with open(save_to, "a") as f:
+            f.write(msg + "\n")
+
+   
+    return acc, cert_acc, abstain_pct, avg_r, total_time, ms_per_sample
+def train_and_evaluate_on_adversarial_folds(
+    base_model_class,
+    adaptive_model_class,  
+    X_train_tensor,
+    y_train_tensor,
+    X_test_tensor,
+    y_test_tensor,
+    adversarial_loaders,
+    num_classes,
+    initial_sigma,
+    batch_size=64,
+    num_epochs=30,
+    folds=5,
+    output_file="unsw_originalSmoothing.txt",
+):
+    import os, time
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset, Subset
+    from sklearn.model_selection import KFold
+    from collections import defaultdict
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---------- helpers ----------
+    def _load_matrix(path: str) -> np.ndarray:
+        try:
+            return np.loadtxt(path, delimiter=",", dtype=np.float32)
+        except Exception:
+            return np.loadtxt(path, dtype=np.float32)
+
+    def _ensure_dir(path: str):
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+    # ---------- file header ----------
+    _ensure_dir(output_file)
+    with open(output_file, "w") as f:
+        f.write("===== Adversarial Evaluation Results (Original RS) =====\n")
+        f.write(f"initial_sigma = {initial_sigma}\n")
+        f.write(f"folds        = {folds}\n")
+        f.write(f"batch_size   = {batch_size}\n")
+        f.write(f"epochs       = {num_epochs}\n")
+        f.write("Reported metrics: Acc (%), Certified (%), Abstain (%), Avg R, "
+                "TimeTot (s), Cert ms/sample\n\n")
+
+    # ---------- datasets & loaders ----------
+    test_dataset  = TensorDataset(X_test_tensor, y_test_tensor)
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader  = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader   = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
+
+    # ---------- preload adversarial matrices ----------
+    preloaded_adv = {}
+    for name, path in adversarial_loaders.items():
+        mat = _load_matrix(path).astype(np.float32)
+        preloaded_adv[name] = mat
+
+    n_test = X_test_tensor.shape[0]
+    for name, mat in preloaded_adv.items():
+        if mat.shape[0] < n_test:
+            raise ValueError(f"[{name}] has {mat.shape[0]} rows < test size {n_test}.")
+        if mat.shape[1] != X_train_tensor.shape[1]:
+            raise ValueError(f"[{name}] feature dim {mat.shape[1]} != train dim {X_train_tensor.shape[1]}.")
+
+    # ---------- init base + smoother ----------
+    print("Initializing models...")
+    base_model = base_model_class(input_size=X_train_tensor.shape[1], dropout_rate=0.5).to(device)
+    smoother = adaptive_model_class(base_classifier=base_model, num_classes=num_classes, sigma=float(initial_sigma))
+
+    # ---------- train base (with Gaussian noise_sd = initial_sigma) ----------
+    print("Training OriginalSmooth model...")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(base_model.parameters(), lr=1e-3)
+    noise_sd = float(initial_sigma)  
+
+    base_model.train()
+    for epoch in range(num_epochs):
+        running = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device); yb = yb.to(device)
+            optimizer.zero_grad()
+            noisy_xb = xb + torch.randn_like(xb) * noise_sd
+            logits = base_model(noisy_xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+            running += loss.item()
+        print(f"[OriginalRS] Epoch {epoch+1}/{num_epochs} loss={running/len(train_loader):.4f}")
+
+    # ---------- clean eval ----------
+    print("Evaluating OriginalSmooth model on clean test...")
+    base_model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            preds = base_model(xb).argmax(1)
+            correct += (preds == yb).sum().item()
+            total += yb.size(0)
+    clean_acc = 100.0 * correct / total if total > 0 else 0.0
+    print(f"Clean Test Accuracy: {clean_acc:.2f}%")
+    with open(output_file, "a") as f:
+        f.write(f"Clean Test Accuracy: {clean_acc:.2f}%\n")
+
+    # ---------- k-fold on adversarial ----------
+    kf = KFold(n_splits=folds, shuffle=True, random_state=42)
+    # store (acc, cert_acc, abstain%, avgR, time_s, ms_per_sample) per attack per fold
+    adversarial_summary = defaultdict(list)
+
+    for fold, (_, test_idx) in enumerate(kf.split(test_dataset), start=1):
+        print(f"\n===== Fold {fold}/{folds} =====")
+        val_subset = Subset(test_dataset, test_idx)
+        y_val = torch.stack([val_subset[i][1] for i in range(len(val_subset))]).cpu().numpy()
+
+        with open(output_file, "a") as f:
+            f.write(f"\nFold {fold} (Clean Acc full test: {clean_acc:.2f}%)\n")
+
+        for attack_name, mat in preloaded_adv.items():
+            X_adv_fold = torch.tensor(mat[np.array(test_idx)], dtype=torch.float32, device=device)
+
+            # call updated evaluator 
+            acc, cert_acc, abstain_pct, avg_r, time_s, ms_ps = test_on_adversarial_original(
+                smoother, X_adv_fold, y_val,
+                n0=100, n=1000, alpha=0.001, batch_size=batch_size,
+                save_to=output_file,
+                tag=f"[sigma={initial_sigma}] [fold={fold}] [attack={attack_name}]"
+            )
+
+            adversarial_summary[attack_name].append((acc, cert_acc, abstain_pct, avg_r, time_s, ms_ps))
+
+            # per-fold log line
+            with open(output_file, "a") as f:
+                f.write(
+                    f"  {attack_name}: "
+                    f"Acc={acc:.2f}%, "
+                    f"Certified={cert_acc:.2f}%, "
+                    f"Abstain={abstain_pct:.2f}%, "
+                    f"AvgR={avg_r:.4f}, "
+                    f"TimeTot={time_s:.2f}s, "
+                    f"Cert ms/sample={ms_ps:.2f}\n"
+                )
+
+    # ---------- summary across folds ----------
+    print("\n===== Adversarial Evaluation Summary =====")
+    with open(output_file, "a") as f:
+        f.write("\n===== Adversarial Evaluation Summary =====\n")
+        for atk, metrics in adversarial_summary.items():
+            arr = np.array(metrics, dtype=float) 
+            avg_acc   = float(arr[:, 0].mean())
+            avg_cert  = float(arr[:, 1].mean())
+            avg_abs   = float(arr[:, 2].mean())
+            avg_r     = float(arr[:, 3].mean())
+            avg_time  = float(arr[:, 4].mean())
+            avg_msps  = float(arr[:, 5].mean())
+            line = (f"{atk}: Avg Acc={avg_acc:.2f}%, "
+                    f"Avg Certified={avg_cert:.2f}%, "
+                    f"Avg Abstain={avg_abs:.2f}%, "
+                    f"Avg R={avg_r:.4f}, "
+                    f"Avg Time={avg_time:.2f}s, "
+                    f"Avg Cert ms/sample={avg_msps:.2f}")
+            print(line); f.write(line + "\n")
+
+    # return per-attack summary dict (now with 6-tuple entries) for σ-sweep aggregation
+    return adversarial_summary
+
+
+# ===== σ-sweep for Original Randomized Smoothing (no BARS) =====
+
+
+adversarial_loaders = {
+   "PGD": "X_adv_pgd_unsw2.txt",
+    "JSMA": "X_adv_jsma_unsw.txt",
+    "DeepFool": "X_adv_df_unsw.txt",
+    "FGSM": "X_adv_fgsm_unsw2.txt",
+    "ZOO": "X_adv_zoo_agg_unsw.txt",
+    "CW": "X_adv_cw_agg_unsw.txt",
+    "LPF": "X_adv_lpf_unsw.csv",
+    "HSJ": "X_adv_hsj_unsw.txt",
+}
+
+# ---- sweep settings ----
+sigma_grid = [0.15, 0.30, 0.5]
+results_dir = "results_original_rs_sigma_sweep"
+os.makedirs(results_dir, exist_ok=True)
+
+combined_summary_path = os.path.join(results_dir, "sweep_summary_original_rs.txt")
+with open(combined_summary_path, "w") as f:
+    f.write("===== Original RS σ Sweep Summary =====\n")
+    f.write(f"sigma_grid = {sigma_grid}\n\n")
+    f.write("Reported metrics: Avg Acc (%), Avg Certified (%), Avg Abstain (%), "
+            "Avg R, Avg Time (s), Avg Cert ms/sample\n\n")
+
+def _avg_metrics(summary_dict):
+    """
+    summary_dict: {attack: [(acc, cert_acc, abstain_pct, avg_R, total_time_s, ms_per_sample), ... per fold]}
+    returns: {attack: (mean_acc, mean_cert, mean_abstain, mean_avgR, mean_time_s, mean_ms_per_ex)}
+    """
+    out = {}
+    for attack, tuples in summary_dict.items():
+        if len(tuples) == 0:
+            continue
+        arr = np.array(tuples, dtype=float)  # shape: [num_folds, 6]
+        mean_acc       = float(arr[:, 0].mean())
+        mean_cert      = float(arr[:, 1].mean())
+        mean_abstain   = float(arr[:, 2].mean())
+        mean_avgR      = float(arr[:, 3].mean())
+        mean_time_s    = float(arr[:, 4].mean())
+        mean_ms_per_ex = float(arr[:, 5].mean())
+        out[attack] = (mean_acc, mean_cert, mean_abstain, mean_avgR, mean_time_s, mean_ms_per_ex)
+    return out
+
+all_sigma_results = {}
+
+for sigma in sigma_grid:
+    per_sigma_file = os.path.join(results_dir, f"orig_rs_sigma_{sigma:.2f}.txt")
+
+    # Run k-fold train+eval for Original RS (returns 6-tuple metrics per attack/fold)
+    results = train_and_evaluate_on_adversarial_folds(
+        base_model_class=TabularNN,
+        adaptive_model_class=Smooth,         # Original RS class
+        X_train_tensor=X_train_tensor,
+        y_train_tensor=y_train_tensor,
+        X_test_tensor=X_test_tensor,
+        y_test_tensor=y_test_tensor,
+        adversarial_loaders=adversarial_loaders,
+        num_classes=2,
+        initial_sigma=sigma,                 # sweep σ here
+        batch_size=64,
+        num_epochs=30,
+        folds=5,
+        output_file=per_sigma_file,
+    )
+
+    # Average across folds and append to combined summary
+    avg = _avg_metrics(results)
+    all_sigma_results[sigma] = avg
+
+    with open(combined_summary_path, "a") as f:
+        f.write(f"\n=== σ = {sigma:.2f} ===\n")
+        for attack in adversarial_loaders.keys():
+            if attack not in avg:
+                continue
+            acc, cert_acc, abstain, avgR, time_s, ms_ps = avg[attack]
+            f.write(
+                f"{attack}: "
+                f"Avg Acc={acc:.2f}%, "
+                f"Avg Certified={cert_acc:.2f}%, "
+                f"Avg Abstain={abstain:.2f}%, "
+                f"Avg R={avgR:.4f}, "
+                f"Avg Time={time_s:.2f}s, "
+                f"Avg Cert ms/sample={ms_ps:.2f}\n"
+            )
+
+print(f"\nPer-σ files saved under: {results_dir}")
+print(f"Combined summary saved to: {combined_summary_path}")
