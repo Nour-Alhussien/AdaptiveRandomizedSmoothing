@@ -1,0 +1,578 @@
+!pip install adversarial-robustness-toolbox
+
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+import numpy as np
+
+# Load datasets
+train = pd.read_csv('cic_balanced_train_data.csv')
+test = pd.read_csv('cic_balanced_test_data.csv')
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Separate features and target
+X_train = train.drop(columns=['Label']).values
+y_train = train['Label'].values
+X_test = test.drop(columns=['Label']).values
+y_test = test['Label'].values
+
+# X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+
+# # Convert the data to PyTorch tensors
+X_train_tensor = torch.tensor(np.array(X_train), dtype=torch.float32)  # Ensure X_train is converted to numpy
+y_train_tensor = torch.tensor(np.array(y_train), dtype=torch.long)
+X_test_tensor = torch.tensor(np.array(X_test), dtype=torch.float32)
+y_test_tensor = torch.tensor(np.array(y_test), dtype=torch.long)
+
+print(f"Train features tensor shape: {X_train_tensor.shape}")
+print(f"Train labels tensor shape: {y_train_tensor.shape}")
+
+# Step 1: Find column names that start with 'cat__'
+categorical_columns = [col for col in test.columns if col.startswith('cat__')]
+
+# Step 2: Get their indices in the DataFrame
+cat_idxs = [test.columns.get_loc(col) for col in categorical_columns]
+
+print("Categorical Feature Indices:", cat_idxs)
+
+### Train a normal model to test it against the adversarail examples, to help us find the improvement in accuracy after the defense###
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from torch.utils.data import DataLoader
+from scipy.stats import norm
+from statsmodels.stats.proportion import proportion_confint
+from math import ceil
+# Tabular Neural Network Definition
+class TabularNN(nn.Module):
+    def __init__(self, input_size, dropout_rate=0.25):
+        super(TabularNN, self).__init__()
+        self.fc1 = nn.Linear(input_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 32)
+        self.fc4 = nn.Linear(32, 2)  # Output 2 logits for binary classification
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = torch.relu(self.fc2(x))
+        x = torch.relu(self.fc3(x))
+        x = self.fc4(x)  # Output logits
+        return x
+
+### Train a normal model to test it against the adversarail examples, to help us find the improvement in accuracy after the defense###
+
+import time
+
+# Model setup
+input_size = X_train_tensor.shape[1]
+model = TabularNN(input_size=input_size).to(device)
+
+# Loss and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# DataLoader setup
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+# File to save results
+results_file = "cis_original_evaluation_results.txt"
+
+# Clear the results file if it exists
+with open(results_file, "w") as f:
+    f.write("Model Evaluation Results\n")
+    f.write("=" * 50 + "\n")
+
+# Training loop
+epochs = 10
+for epoch in range(epochs):
+    model.train()
+    running_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    epoch_loss = running_loss / len(train_loader)
+    print(f"Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss:.4f}")
+    with open(results_file, "a") as f:
+        f.write(f"Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss:.4f}\n")
+
+# Testing on adversarial examples
+adversarial_loaders = {
+    "PGD": "X_adv_pgd.csv",
+    "JSMA": "X_adv_jsma.csv",
+    "DeepFool": "X_adv_df.csv",
+    "FGSM": "X_adv_fgsm.csv",
+    "ZOO": "X_adv_zoo_agg.csv",
+    "HSJ": "X_adv_hsj_cic.txt",
+    "CW": "X_adv_cw_new.txt",
+    "LPF": "X_adv_lpf.csv",
+
+}
+
+# Testing on clean test data
+model.eval()
+with torch.no_grad():
+    X_test_tensor, y_test_tensor = X_test_tensor.to(device), y_test_tensor.to(device)
+    test_outputs = model(X_test_tensor)
+    test_predictions = torch.argmax(test_outputs, axis=1)
+    clean_accuracy = accuracy_score(y_test_tensor.cpu().numpy(), test_predictions.cpu().numpy())
+    print(f"Clean test accuracy: {clean_accuracy:.4f}")
+    with open(results_file, "a") as f:
+        f.write(f"\nClean test accuracy: {clean_accuracy:.4f}\n")
+
+# Evaluate on adversarial examples
+for attack_name, file_path in adversarial_loaders.items():
+    # Load adversarial data
+    X_adv = np.loadtxt(file_path, delimiter=",")  # Load the CSV as a NumPy array
+    X_adv_tensor = torch.tensor(X_adv, dtype=torch.float32).to(device)
+    # to solve the mismatch size between x_adv and  y_true
+
+    # Record evaluation time
+    start_time = time.time()
+    with torch.no_grad():
+        adv_outputs = model(X_adv_tensor)
+        adv_predictions = torch.argmax(adv_outputs, axis=1)
+    end_time = time.time()
+
+    # Compute adversarial accuracy
+    adv_accuracy = accuracy_score(y_test_tensor.cpu().numpy(), adv_predictions.cpu().numpy())
+    eval_time = end_time - start_time
+
+    # Print and save results
+    print(f"{attack_name} adversarial accuracy: {adv_accuracy:.4f}")
+    print(f"Time taken for {attack_name} evaluation: {eval_time:.4f} seconds")
+    with open(results_file, "a") as f:
+        f.write(f"{attack_name} adversarial accuracy: {adv_accuracy:.4f}\n")
+        f.write(f"Time taken for {attack_name} evaluation: {eval_time:.4f} seconds\n")
+
+# Testing on adversarial examples
+adversarial_loaders = {
+    "PGD": "X_adv_pgd.csv",
+    "JSMA": "X_adv_jsma.csv",
+    "DeepFool": "X_adv_df.csv",
+    "FGSM": "X_adv_fgsm.csv",
+    "ZOO": "X_adv_zoo_sim.csv",
+    "HSJ": "X_adv_hsj_cic.txt",
+    "CW": "X_adv_cw_new.txt",
+    "LPF": "X_adv_lpf.csv",
+
+}
+
+# Testing on clean test data
+model.eval()
+with torch.no_grad():
+    X_test_tensor, y_test_tensor = X_test_tensor.to(device), y_test_tensor.to(device)
+    test_outputs = model(X_test_tensor)
+    test_predictions = torch.argmax(test_outputs, axis=1)
+    clean_accuracy = accuracy_score(y_test_tensor.cpu().numpy(), test_predictions.cpu().numpy())
+    print(f"Clean test accuracy: {clean_accuracy:.4f}")
+    with open(results_file, "a") as f:
+        f.write(f"\nClean test accuracy: {clean_accuracy:.4f}\n")
+
+# Evaluate on adversarial examples
+for attack_name, file_path in adversarial_loaders.items():
+    # Load adversarial data
+    X_adv = np.loadtxt(file_path, delimiter=",")  # Load the CSV as a NumPy array
+    X_adv_tensor = torch.tensor(X_adv, dtype=torch.float32).to(device)
+    # to solve the mismatch size between x_adv and  y_true
+
+    # Record evaluation time
+    start_time = time.time()
+    with torch.no_grad():
+        adv_outputs = model(X_adv_tensor)
+        adv_predictions = torch.argmax(adv_outputs, axis=1)
+    end_time = time.time()
+
+    # Compute adversarial accuracy
+    adv_accuracy = accuracy_score(y_test_tensor.cpu().numpy(), adv_predictions.cpu().numpy())
+    eval_time = end_time - start_time
+
+    # Print and save results
+    print(f"{attack_name} adversarial accuracy: {adv_accuracy:.4f}")
+    print(f"Time taken for {attack_name} evaluation: {eval_time:.4f} seconds")
+    with open(results_file, "a") as f:
+        f.write(f"{attack_name} adversarial accuracy: {adv_accuracy:.4f}\n")
+        f.write(f"Time taken for {attack_name} evaluation: {eval_time:.4f} seconds\n")
+
+def generate_adversarial_examples(attack, X_original, cat_idxs=None):
+
+    X_adv = attack.generate(x=X_original)
+
+    # Restore original categorical features to ensure they remain valid
+    if cat_idxs and len(cat_idxs) > 0:
+        X_adv[:, cat_idxs] = X_original[:, cat_idxs]
+
+    return X_adv
+
+#X_test_np = X_test_tensor.cpu().numpy()
+
+from art.attacks.evasion import ProjectedGradientDescent, CarliniL2Method, ZooAttack, HopSkipJump, FastGradientMethod, DeepFool, SaliencyMapMethod
+from art.estimators.classification import PyTorchClassifier
+from torch.utils.data import DataLoader, TensorDataset
+import torch
+import numpy as np
+
+# Ensure model and data are on the correct device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+# Create a PyTorchClassifier for ART
+classifier = PyTorchClassifier(
+     model=model,
+     clip_values=(0, 1),
+     loss=criterion,
+     optimizer=optimizer,
+     input_shape=(X_test_tensor.shape[1],),
+     nb_classes=2,
+     device_type="gpu" if torch.cuda.is_available() else "cpu",
+ )
+
+# Define attack parameters
+zoo_attack = ZooAttack(
+     classifier,
+     confidence=0.8,  # Confidence of adversarial examples
+     targeted=False,
+     learning_rate=0.01,
+     nb_parallel= 5,
+     variable_h = 0.8,
+     max_iter=40,  # Number of iterations
+ )
+
+
+cw_attack = CarliniL2Method(
+     classifier=classifier,
+     confidence=0.0,
+     targeted=False,
+     learning_rate=0.001,
+     max_iter=10,  # Number of iterations
+     binary_search_steps=5, # on cic it was 10
+     initial_const=0.01,
+     max_halving=3,
+     max_doubling=3,
+ )
+
+pgd = ProjectedGradientDescent(estimator=classifier, eps=0.15, eps_step=0.01, max_iter=40)#aggressive attack with inf norm
+
+deepfool = DeepFool(classifier, max_iter=10)
+
+saliency = SaliencyMapMethod(classifier)
+
+fgsm = FastGradientMethod(classifier, eps=0.15)#aggressive attack with inf norm
+
+hsj = HopSkipJump(classifier, max_iter=64, max_eval=10000, init_eval=100, init_size=100)
+
+# Convert data to numpy
+X_test_np = X_test_tensor.cpu().numpy()
+y_test_np = y_test_tensor.cpu().numpy()
+
+# Generate PGD adversarial examples
+print("Generating PGD adversarial examples...")
+X_adv_pgd = generate_adversarial_examples(pgd, X_test_np, cat_idxs)
+#X_adv_pgd = pgd.generate(X_test_np)
+np.savetxt("X_adv_pgd_cic_M.txt", X_adv_pgd, delimiter=",")
+print("Saved PGD adversarial examples to 'X_adv_pgd_cic_M_norm.txt'.")
+
+# Generate FGSM adversarial examples
+print("Generating FGSM adversarial examples...")
+X_adv_fgsm = generate_adversarial_examples(fgsm, X_test_np, cat_idxs)
+#X_adv_fgsm = fgsm.generate(X_test_np)
+np.savetxt("X_adv_fgsm_cic_M.txt", X_adv_fgsm, delimiter=",")
+print("Saved FGSM adversarial examples to 'X_adv_fgsm_cic_M_norm.txt'.")
+
+# Generate DeepFool adversarial examples
+print("Generating DeepFool adversarial examples...")
+X_adv_df = generate_adversarial_examples(deepfool, X_test_np, cat_idxs)
+#X_adv_df = deepfool.generate(X_test_np)
+np.savetxt("X_adv_df_cic_M.txt", X_adv_df, delimiter=",")
+print("Saved DeepFool adversarial examples to 'X_adv_df_cic_M.txt'.")
+
+# Generate SaliencyMapMethod adversarial examples
+print("Generating SaliencyMapMethod adversarial examples...")
+X_adv_jsma = generate_adversarial_examples(saliency, X_test_np, cat_idxs)
+#X_adv_jsma = saliency.generate(X_test_np)
+np.savetxt("X_adv_jsma_cic_M.txt", X_adv_jsma, delimiter=",")
+print("Saved JSMA adversarial examples to 'X_adv_jsma_cic_M.txt'.")
+
+import torch
+import torch.nn as nn
+
+# Wrap your existing model to force fp32 at the very start
+class FP32Wrapper(nn.Module):
+    def __init__(self, base_model):
+        super().__init__()
+        self.base = base_model
+
+    def forward(self, x, *args, **kwargs):
+        x = x.to(torch.float32)  # <- force inputs to float32
+        return self.base(x, *args, **kwargs)
+
+# Build a wrapped model (no retrain needed)
+wrapped_model = FP32Wrapper(model).to(next(model.parameters()).device).eval()
+
+from art.estimators.classification import PyTorchClassifier
+
+classifier = PyTorchClassifier(
+    model=wrapped_model,                 # <- use wrapper
+    clip_values=(0, 1),
+    loss=criterion,
+    optimizer=optimizer,
+    input_shape=(X_test_tensor.shape[1],),
+    nb_classes=2,
+    device_type="gpu" if torch.cuda.is_available() else "cpu",
+)
+
+from art.attacks.evasion import HopSkipJump
+
+hsj = HopSkipJump(classifier, max_iter=64, max_eval=10000, init_eval=100, init_size=100)
+
+# Make sure inputs to attack are float32 (good practice)
+X_test_np = X_test_tensor.cpu().numpy().astype(np.float32)
+
+print("Generating HSJ adversarial examples...")
+X_adv_hsj = generate_adversarial_examples(hsj, X_test_np, cat_idxs)
+np.savetxt("X_adv_hsj_cic_M.txt", X_adv_hsj, delimiter=",")
+print("Saved HSJ adversarial examples to 'X_adv_hsj_cic_M.txt'.")
+
+# Generate CW adversarial examples
+print("Generating CW adversarial examples...")
+X_adv_cw = generate_adversarial_examples(cw_attack, X_test_np, cat_idxs)
+#X_adv_cw = cw_attack.generate(X_test_np)
+np.savetxt("X_adv_cw_agg_cic_M.txt", X_adv_cw, delimiter=",")
+print("Saved CW adversarial examples to 'X_adv_cw_new_M.txt'.")
+
+# Generate ZOO adversarial examples
+print("Generating ZOO adversarial examples...")
+X_adv_zoo = generate_adversarial_examples(zoo_attack, X_test_np, cat_idxs)
+#X_adv_zoo = zoo_attack.generate(X_test_np)
+np.savetxt("X_adv_zoo_agg_cic_M.txt", X_adv_zoo, delimiter=",")
+print("Saved ZOO adversarial examples to 'X_adv_zoo_new_M.txt'.")
+
+import torch.nn.functional as F
+
+# Clipping function
+def clip(current, low_bound, up_bound):
+    # Convert bounds to tensors
+    low_bound = torch.tensor(low_bound, dtype=torch.float32, device=current.device).unsqueeze(0)  # Add batch dimension
+    up_bound = torch.tensor(up_bound, dtype=torch.float32, device=current.device).unsqueeze(0)    # Add batch dimension
+
+    # Clip values
+    clipped = torch.max(torch.min(current, up_bound), low_bound)
+    return clipped
+
+import torch
+
+def lowProFool(x, model, weights, bounds, maxiters, alpha, lambda_, device):
+    """
+    LowProFool adversarial attack implementation with weighted loss.
+
+    Args:
+        x (torch.Tensor): Input sample.
+        model (torch.nn.Module): Target model.
+        weights (list or np.array): Feature importance weights.
+        bounds (tuple): Feature bounds as (min, max).
+        maxiters (int): Maximum number of iterations.
+        alpha (float): Step size for gradient update.
+        lambda_ (float): Regularization weight for L2 loss.
+        device (torch.device): Device to run computations on.
+
+    Returns:
+        orig_pred (int): Original prediction class.
+        output_pred (int): Adversarial prediction class.
+        best_pert_x (np.array): Adversarial example.
+    """
+    # Initialize inputs and parameters
+    x = x.unsqueeze(0).to(device).float()  # Ensure input is float32
+    x.requires_grad = True
+    r = torch.tensor(1e-4 * torch.ones_like(x), device=device, requires_grad=True)  # Perturbation
+    v = torch.tensor(weights, device=device).float()  # Feature importance weights
+
+    # Initial prediction
+    logits = model(x + r)
+    orig_pred = logits.argmax(dim=1).item()
+
+    # Define target class (opposite of original prediction)
+    target_pred = 1 - orig_pred
+    target = torch.tensor([target_pred], device=device).long()
+
+    # Define loss functions
+    criterion = torch.nn.CrossEntropyLoss()
+    l2 = lambda v, r: torch.sqrt(torch.sum((v * r) ** 2))  # Weighted L2 norm
+
+    best_norm_weighted = float('inf')
+    best_pert_x = x.clone()
+
+    # Iterative attack
+    for loop_i in range(maxiters):
+        if r.grad is not None:
+            r.grad.zero_()
+
+        # Compute logits and losses
+        logits = model(x + r)
+        loss_1 = criterion(logits, target)  # Classification loss
+        loss_2 = l2(v, r)  # Regularization loss
+        loss = loss_1 + lambda_ * loss_2  # Total loss
+
+        # Backpropagate the loss
+        loss.backward()
+
+        # Gradient update for perturbation
+        with torch.no_grad():
+            r -= alpha * r.grad  # Update perturbation
+
+        # Clamp the perturbed sample within the bounds
+        xprime = x + r
+        bounds_min = torch.tensor(bounds[0], device=device).float()
+        bounds_max = torch.tensor(bounds[1], device=device).float()
+        xprime = torch.clamp(xprime, bounds_min, bounds_max)
+
+        # Evaluate adversarial prediction
+        logits = model(xprime)
+        output_pred = logits.argmax(dim=1).item()
+
+        # Update best adversarial example based on weighted L2 norm
+        weighted_norm = torch.sum(torch.abs(r * v)).item()
+        if output_pred != orig_pred and weighted_norm < best_norm_weighted:
+            best_norm_weighted = weighted_norm
+            best_pert_x = xprime.clone()
+
+    # Ensure the final adversarial example is clamped
+    best_pert_x = torch.clamp(best_pert_x, bounds_min, bounds_max)
+    logits = model(best_pert_x)
+    output_pred = logits.argmax(dim=1).item()
+
+    return orig_pred, output_pred, best_pert_x.squeeze(0).detach().cpu().numpy()
+
+import numpy as np
+import torch
+from torch.autograd import Variable
+from scipy.stats import pearsonr
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Assuming model and data (X_train_np, X_test_np) are already loaded and preprocessed.
+
+# Adjust feature importance computation to avoid constant features
+feature_importance_weights = []
+for i in range(X_train.shape[1]):
+    if np.all(X_train[:, i] == X_train[0, i]):  # Check if the feature is constant
+        feature_importance_weights.append(0.0)  # Assign zero weight to constant features
+    else:
+        correlation, _ = pearsonr(X_train[:, i], y_train)
+        feature_importance_weights.append(abs(correlation))
+
+feature_importance_weights = np.array(feature_importance_weights, dtype=np.float32)
+
+# Define feature bounds based on the training data
+feature_min = X_train.min(axis=0)
+feature_max = X_train.max(axis=0)
+feature_bounds = (feature_min, feature_max)
+
+# Parameters for LowProFool attack
+max_iters = 50
+alpha = 0.005
+lambda_ = 0.5
+
+# Store adversarial examples
+adversarial_examples = []
+adversarial_accuracy = 0
+num_samples = X_test.shape[0]  # Number of test samples
+# Convert original X_test to numpy float32 to restore teh catagorical
+X_test_np = X_test.astype(np.float32)
+
+model.eval()  # Set the model to evaluation mode
+for i in range(num_samples):  # Iterate through each test sample
+    #print(f"Processing test sample {i + 1}/{num_samples}...")
+
+    # Access each test sample from the numpy array
+    x_test_sample = X_test[i]
+
+    # Convert the test sample to torch.Tensor
+    x_test_sample_tensor = torch.tensor(x_test_sample, dtype=torch.float32).to(device)
+
+    # Generate adversarial example using LowProFool attack
+    orig_pred, adv_pred, adv_example = lowProFool(
+        x_test_sample_tensor, model, feature_importance_weights, feature_bounds, max_iters, alpha, lambda_, device
+    )
+
+    # Store the generated adversarial example
+    adversarial_examples.append(adv_example)
+
+    # Check if the original prediction and adversarial prediction are the same
+    if orig_pred == adv_pred:
+        adversarial_accuracy += 1
+
+# Convert adversarial examples to a numpy array
+#adversarial_examples = np.array(adversarial_examples)
+adversarial_examples = np.array(adversarial_examples, dtype=np.float32)
+
+# Restore categorical columns from original test data
+adversarial_examples[:, cat_idxs] = X_test_np[:, cat_idxs]
+
+# Save all adversarial examples to a single file
+np.savetxt("X_adv_lowprofool_cic_M_lessaggr.csv", adversarial_examples, delimiter=",")
+
+# Calculate adversarial accuracy
+adversarial_accuracy /= num_samples
+print(f'Adversarial Accuracy: {adversarial_accuracy * 100:.2f}%')
+
+# Testing on adversarial examples
+adversarial_loaders = {
+    "PGD": "X_adv_pgd_cic_M.txt",
+    "JSMA": "X_adv_jsma_cic_M.txt",
+    "DeepFool": "X_adv_df_cic_M.txt",
+    "FGSM": "X_adv_fgsm_cic_M.txt",
+    "ZOO": "X_adv_zoo_agg_cic_M.txt",
+    "CW": "X_adv_cw_agg_cic_M.txt",
+    "LPF": "X_adv_lowprofool_cic_M.csv",
+    "HSJ": "X_adv_hsj_cic_M.txt"
+
+}
+
+# Testing on clean test data
+model.eval()
+with torch.no_grad():
+    X_test_tensor, y_test_tensor = X_test_tensor.to(device), y_test_tensor.to(device)
+    test_outputs = model(X_test_tensor)
+    test_predictions = torch.argmax(test_outputs, axis=1)
+    clean_accuracy = accuracy_score(y_test_tensor.cpu().numpy(), test_predictions.cpu().numpy())
+    print(f"Clean test accuracy: {clean_accuracy:.4f}")
+    with open(results_file, "a") as f:
+        f.write(f"\nClean test accuracy: {clean_accuracy:.4f}\n")
+
+# Evaluate on adversarial examples
+for attack_name, file_path in adversarial_loaders.items():
+    # Load adversarial data
+    X_adv = np.loadtxt(file_path, delimiter=",")  # Load the CSV as a NumPy array
+    X_adv_tensor = torch.tensor(X_adv, dtype=torch.float32).to(device)
+    # to solve the mismatch size between x_adv and  y_true
+
+    # Record evaluation time
+    start_time = time.time()
+    with torch.no_grad():
+        adv_outputs = model(X_adv_tensor)
+        adv_predictions = torch.argmax(adv_outputs, axis=1)
+    end_time = time.time()
+
+    # Compute adversarial accuracy
+    adv_accuracy = accuracy_score(y_test_tensor.cpu().numpy(), adv_predictions.cpu().numpy())
+    eval_time = end_time - start_time
+
+    # Print and save results
+    print(f"{attack_name} adversarial accuracy: {adv_accuracy:.4f}")
+    print(f"Time taken for {attack_name} evaluation: {eval_time:.4f} seconds")
+    with open(results_file, "a") as f:
+        f.write(f"{attack_name} adversarial accuracy: {adv_accuracy:.4f}\n")
+        f.write(f"Time taken for {attack_name} evaluation: {eval_time:.4f} seconds\n")
