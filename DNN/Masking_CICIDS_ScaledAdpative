@@ -159,7 +159,7 @@ class AdaptiveSmoothEntropy:
         return (top2[0] - top2[1]).item(), top2[0].item()
 
     def _adaptive_sample_size(self, margin, confidence, n_base, max_scale=3.0, gamma=2.0):
-        scale = max(1.0, (1.0 - margin) * (1.0 - confidence) * gamma)
+        scale = max(1.0, 1 + (1.0 - margin) * (1.0 - confidence) * gamma))
         scale = min(scale, max_scale)
         return int(ceil(n_base * scale))
 
