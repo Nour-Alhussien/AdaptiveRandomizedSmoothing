@@ -1,5 +1,5 @@
 # AdaptiveScaledRandomizedSmoothing
-This project trains a tabular neural network on a balanced UNSW-NB15 split, generates adversarial examples with the Adversarial Robustness Toolbox (ART), and evaluates two certification schemes:
+This project trains a tabular neural network on three datasets including UNSW-NB15, URL, and CICIDS2018 datsets, and generates adversarial examples with the Adversarial Robustness Toolbox (ART), and evaluates two certification schemes:
 
 * Original randomized smoothing (baseline)
 
