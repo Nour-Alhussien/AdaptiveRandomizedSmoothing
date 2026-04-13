@@ -1,5 +1,4 @@
-# AdaptiveRandomizedSmoothing
-# Adaptive Scaled Randomized Smoothing (ARS)
+# AdaptiveRandomizedSmoothing(ARS)
 
 This project implements and evaluates **Adaptive Randomized Smoothing (ARS)** for tabular data. The framework trains neural networks on three datasets—**UNSW-NB15**, **URL**, and **CICIDS2018**—generates adversarial examples using the **Adversarial Robustness Toolbox (ART)**, and evaluates certified robustness using two schemes:
 
